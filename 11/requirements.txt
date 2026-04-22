@@ -1,0 +1,27 @@
+# ==============================================
+# LLM API Dependencies
+# ==============================================
+anthropic>=0.40.0
+dashscope>=1.0.0  # Qwen API (通义千问)
+
+# ==============================================
+# Image Processing & Computer Vision
+# ==============================================
+opencv-python==4.8.1.78
+opencv-contrib-python==4.8.1.78  # For SURF and other contrib modules
+numpy==1.26.4
+Pillow>=10.0.0
+scipy>=1.11.0
+scikit-image>=0.21.0  # For SSIM and other image metrics
+imagehash>=4.3.0  # For perceptual hash comparison
+
+# ==============================================
+# Web Framework & HTTP
+# ==============================================
+Flask>=2.3.0
+requests>=2.31.0
+
+# ==============================================
+# Optional: GUI Support (通常随 Python 安装)
+# ==============================================
+# tkinter (通常随 Python 安装，无需单独安装)
