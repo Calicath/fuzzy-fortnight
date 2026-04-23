@@ -24,7 +24,7 @@ def run(
     执行完整的图像匹配流程
     """
     from agents.llm_agent import run_llm_recommendation
-    from agents.algorithm_downloader import download_and_execute, check_and_install_deps
+    from agents.algorithm_downloader import download_and_execute
 
     if verbose:
         print("\n" + "=" * 70)
@@ -62,10 +62,7 @@ def run(
             print(f"\n[调度器] 正在处理算法：{algo_name}")
 
         try:
-            # 检查并安装依赖
-            check_and_install_deps(algo_name, verbose=verbose)
-
-            # 获取算法实现
+            # 获取算法实现（会自动分析并安装依赖）
             algo_impl = download_and_execute(algo_name, verbose=verbose)
 
             if algo_impl is None:

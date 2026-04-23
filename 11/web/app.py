@@ -271,31 +271,62 @@ def match_images():
 @app.route('/api/algorithms', methods=['GET'])
 def list_algorithms():
     """获取可用算法列表"""
-    from agents.algorithm_downloader import PIP_PACKAGES
-    
+    # 🔴 现在算法是 LLM 自主推荐的，没有固定列表
+    # 返回常见的算法类型作为参考
+
+    # 这些是 LLM 可能推荐的算法类型（基于提示词中的示例）
+    algorithm_types = [
+        "sift_matching",
+        "orb_matching",
+        "akaze_matching",
+        "brisk_matching",
+        "surf_matching",
+        "template_matching",
+        "phase_correlation_matching",
+        "ssim_matching",
+        "structural_similarity_matching",
+        "histogram_comparison",
+        "normalized_cross_correlation",
+        "image_hash_matching",
+        "perceptual_hash_matching",
+        "fast_matching",
+        "harris_corner_matching",
+        "ecc_alignment_matching",
+        "ncc_matching",
+        "feature_matching",
+        "optical_flow_matching",
+        "lucas_kanade_matching",
+        "farneback_matching",
+        "ransac_matching",
+        "fourier_transform_matching",
+        "wavelet_matching",
+        "mutual_information_matching"
+    ]
+
     return jsonify({
         "success": True,
-        "algorithms": list(PIP_PACKAGES.keys())
+        "algorithms": algorithm_types,
+        "note": "实际推荐算法由 LLM 根据图像特征自主决定，以上仅为常见算法类型参考"
     })
 
 
 def save_uploaded_file(file_storage) -> str:
     """
     保存上传的文件
-    
+
     Returns:
         str: 文件 ID（文件名）
     """
     import uuid
-    
+
     # 生成唯一文件名
     file_id = str(uuid.uuid4())
     file_ext = Path(file_storage.filename).suffix
     file_path = app.config['UPLOAD_FOLDER'] / f"{file_id}{file_ext}"
-    
+
     # 保存文件
     file_storage.save(str(file_path))
-    
+
     # 详细调试信息
     print(f"[上传] UPLOAD_FOLDER: {app.config['UPLOAD_FOLDER']}")
     print(f"[上传] 原始文件名：{file_storage.filename}")
@@ -305,17 +336,17 @@ def save_uploaded_file(file_storage) -> str:
     print(f"[上传] 保存路径（绝对）: {file_path.absolute()}")
     print(f"[上传] 文件是否存在：{file_path.exists()}")
     print(f"[上传] ✅ 文件已保存")
-    
+
     return file_id
 
 
 def cleanup_old_files(max_age_hours=24):
     """清理旧文件"""
     import time
-    
+
     current_time = time.time()
     max_age_seconds = max_age_hours * 3600
-    
+
     for file in app.config['UPLOAD_FOLDER'].glob("*"):
         if file.is_file():
             file_age = current_time - file.stat().st_mtime
@@ -346,5 +377,5 @@ if __name__ == '__main__':
     print("=" * 70)
     print("访问地址：http://localhost:5000")
     print("=" * 70)
-    
-    app.run(debug=False, host='0.0.0.0', port=5000)
+
+    app.run(debug=True, host='0.0.0.0', port=5000)

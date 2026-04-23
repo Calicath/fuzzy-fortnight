@@ -23,60 +23,6 @@ ALGORITHM_CACHE_DIR.mkdir(exist_ok=True)
 
 GITEE_API_BASE = "https://gitee.com/api/v5"
 
-# 算法 → pip 包名 映射（只记录依赖，不生成代码）
-PIP_PACKAGES = {
-    "feature_matching": ["opencv-python", "numpy"],
-    "template_matching": ["opencv-python", "numpy"],
-    "sift_matching": ["opencv-python", "opencv-contrib-python", "numpy"],
-    "orb_matching": ["opencv-python", "numpy"],
-    "akaze_matching": ["opencv-python", "numpy"],
-    "brisk_matching": ["opencv-python", "numpy"],
-    "fast_matching": ["opencv-python", "numpy"],
-    "phase_correlation": ["opencv-python", "numpy", "scipy"],
-    "histogram_comparison": ["opencv-python", "numpy", "scipy"],
-    "ssim_comparison": ["scikit-image", "numpy"],
-    "mutual_information": ["scipy", "numpy"],
-    "normalized_cross_correlation": ["opencv-python", "numpy", "scipy"],
-    "harris_corner": ["opencv-python", "numpy"],
-    "surf_matching": ["opencv-python", "opencv-contrib-python", "numpy"],
-    "flann_matching": ["opencv-python", "numpy"],
-    "image_hash_comparison": ["imagehash", "Pillow", "numpy"],
-}
-
-# 算法名称别名映射（处理 LLM 推荐的不同命名变体）
-ALGORITHM_ALIASES = {
-    # SSIM 相关
-    "ssim_similarity": "ssim_comparison",
-    "ssim": "ssim_comparison",
-    "structural_similarity": "ssim_comparison",
-    "structural_similarity_index": "ssim_comparison",
-    # 特征匹配相关
-    "sift": "sift_matching",
-    "sift_feature_matching": "sift_matching",
-    "orb": "orb_matching",
-    "orb_feature_matching": "orb_matching",
-    "akaze": "akaze_matching",
-    "brisk": "brisk_matching",
-    "fast": "fast_matching",
-    "surf": "surf_matching",
-    "flann": "flann_matching",
-    # 模板匹配相关
-    "template": "template_matching",
-    "pattern_matching": "template_matching",
-    # 其他
-    "phase": "phase_correlation",
-    "frequency_domain": "phase_correlation",
-    "histogram": "histogram_comparison",
-    "histogram_matching": "histogram_comparison",
-    "mutual_info": "mutual_information",
-    "ncc": "normalized_cross_correlation",
-    "cross_correlation": "normalized_cross_correlation",
-    "harris": "harris_corner",
-    "harris_corner_detection": "harris_corner",
-    "image_hash": "image_hash_comparison",
-    "perceptual_hash": "image_hash_comparison",
-}
-
 
 def download_and_execute(algo_name: str, verbose: bool = True) -> Optional[object]:
     """
@@ -84,16 +30,10 @@ def download_and_execute(algo_name: str, verbose: bool = True) -> Optional[objec
 
     流程：
     1. 检查缓存 → 有则直接加载
-    2. 有 pip 库 → pip install + LLM 生成调用代码 → 缓存
-    3. 无 pip 库 → Gitee 搜索 Python 实现并下载 → 缓存
+    2. 让 LLM 分析算法需要的依赖包 → pip install
+    3. LLM 生成调用代码 → 缓存
     4. 全部失败 → None
     """
-    # 0. 标准化算法名称（处理别名）
-    original_algo_name = algo_name
-    algo_name = _normalize_algorithm_name(algo_name)
-    if algo_name != original_algo_name and verbose:
-        print(f"[Downloader] 算法名称标准化：{original_algo_name} → {algo_name}")
-    
     # 1. 检查缓存
     cached = _load_from_cache(algo_name)
     if cached is not None:
@@ -101,47 +41,177 @@ def download_and_execute(algo_name: str, verbose: bool = True) -> Optional[objec
             print(f"[Downloader] 从缓存加载：{algo_name}")
         return cached
 
-    # 2. 尝试 pip 安装 + LLM 生成代码
-    pip_packages = PIP_PACKAGES.get(algo_name)
-    if pip_packages:
-        # check_and_install_deps 会在 _llm_generate_code 中调用，这里只检查
-        if check_and_install_deps(algo_name, verbose=verbose):
-            # 让 LLM 生成调用代码（会自动安装额外的 CV 库）
-            code = _llm_generate_code(algo_name, pip_packages, verbose=verbose)
+    # 🔴 2. 让 LLM 自主分析算法需要的依赖包（完全自主，不受任何限制）
+    if verbose:
+        print(f"[Downloader] 正在分析算法 {algo_name} 的依赖...")
+
+    dependencies = _llm_analyze_dependencies(algo_name, verbose=verbose)
+
+    if dependencies:
+        # 安装 LLM 分析的依赖
+        if verbose:
+            print(f"[Downloader] LLM 分析依赖：{dependencies}")
+
+        # 安装依赖
+        if _install_dependencies(dependencies, verbose=verbose):
+            # 让 LLM 生成调用代码
+            code = _llm_generate_code(algo_name, dependencies, verbose=verbose)
             if code:
                 return _save_and_load(code, algo_name, verbose=verbose)
 
-    # 3. Gitee 搜索 Python 实现
-    if verbose:
-        print(f"[Downloader] 在 Gitee 搜索 {algo_name} 的 Python 实现...")
-
-    result = _search_and_download(algo_name, verbose=verbose)
-    if result is not None:
-        return result
-
-    # 4. 全部失败
+    # 3. 全部失败
     if verbose:
         print(f"[Downloader] ❌ 无法获取算法 {algo_name}")
     return None
 
 
+def _llm_analyze_dependencies(algo_name: str, verbose: bool = True) -> Optional[List[str]]:
+    """
+    让 LLM 自主分析算法需要哪些 pip 依赖包
+
+    Args:
+        algo_name: 算法名称
+        verbose: 是否打印日志
+
+    Returns:
+        依赖包列表，如 ['opencv-python', 'numpy']
+    """
+    from agents.llm_agent import call_qwen_text
+
+    if verbose:
+        print(f"[Downloader] 正在让 LLM 分析 {algo_name} 的依赖...")
+
+    system_prompt = """你是一位计算机视觉领域的 Python 专家。
+你的任务：分析图像匹配算法名称，确定需要哪些 pip 包。
+
+仅返回一个 JSON 数组格式的包名列表，例如：
+["opencv-python", "numpy", "scipy"]
+
+不要包含任何解释，只返回 JSON 数组。"""
+
+    user_prompt = f"""算法名称：{algo_name}
+
+这是一个图像匹配/配准/比较算法。
+分析实现这个算法需要哪些 Python 包。
+
+常用包：
+- opencv-python (cv2)：用于大多数 CV 算法（SIFT、ORB、模板匹配等）
+- opencv-contrib-python：用于额外算法如 SURF
+- numpy (np)：用于数组操作
+- scipy：用于信号处理、相位相关
+- scikit-image (skimage)：用于 SSIM、高级图像处理
+- Pillow (PIL)：用于图像加载、图像哈希
+- imagehash：用于感知哈希
+
+返回一个 JSON 数组格式的必需包列表。"""
+
+    try:
+        response = call_qwen_text(system_prompt, user_prompt, max_retries=2)
+
+        if not response:
+            return None
+
+        # 解析 JSON
+        import json
+        # 清理响应（移除 markdown 代码块）
+        response = response.strip()
+        if response.startswith("```"):
+            response = response.split("```")[1]
+            if response.startswith("json"):
+                response = response[4:]
+        response = response.strip()
+
+        dependencies = json.loads(response)
+
+        if isinstance(dependencies, list) and len(dependencies) > 0:
+            # 验证所有项都是字符串
+            if all(isinstance(pkg, str) for pkg in dependencies):
+                if verbose:
+                    print(f"[Downloader] ✅ LLM 分析成功：{dependencies}")
+                return dependencies
+
+        return None
+
+    except Exception as e:
+        if verbose:
+            print(f"[Downloader] ❌ LLM 分析依赖失败：{e}")
+        return None
+
+
+def _install_dependencies(dependencies: List[str], verbose: bool = True) -> bool:
+    """
+    安装依赖包
+
+    Args:
+        dependencies: 依赖包列表
+        verbose: 是否打印日志
+
+    Returns:
+        是否全部安装成功
+    """
+    import subprocess
+
+    all_installed = True
+
+    for pkg in dependencies:
+        try:
+            # 尝试导入（检查是否已安装）
+            # 处理包名和导入名不一致的情况
+            import_name = pkg.replace('-', '_').replace('.', '_')
+
+            if import_name == 'scikit_image':
+                import skimage
+            elif import_name == 'Pillow':
+                from PIL import Image
+            elif import_name == 'opencv_contrib_python':
+                import cv2
+            elif import_name == 'opencv_python':
+                import cv2
+            else:
+                # 动态导入
+                __import__(import_name)
+
+            if verbose:
+                print(f"[Downloader] ✅ {pkg} 已安装")
+
+        except ImportError:
+            # 未安装则自动 pip install
+            if verbose:
+                print(f"[Downloader] 正在安装 {pkg}...")
+
+            try:
+                subprocess.check_call(
+                    [sys.executable, "-m", "pip", "install", pkg, "-q"],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+                if verbose:
+                    print(f"[Downloader] ✅ 已安装 {pkg}")
+            except subprocess.CalledProcessError as e:
+                if verbose:
+                    print(f"[Downloader] ❌ 安装 {pkg} 失败：{e}")
+                all_installed = False
+
+    return all_installed
+
+
 def _llm_generate_code(algo_name: str, dependencies: List[str], verbose: bool = True) -> Optional[str]:
     """
     让 LLM 自动生成算法调用代码，并验证代码能正常运行
-    
+
     Args:
         algo_name: 算法名称
         dependencies: 依赖包列表
         verbose: 是否打印日志
-    
+
     Returns:
         Python 代码字符串
     """
     from agents.llm_agent import call_qwen_text
-    
+
     if verbose:
         print(f"[Downloader] 正在让 LLM 生成 {algo_name} 的调用代码...")
-    
+
     # 确保安装了常用 CV 库
     extra_packages = ['scikit-image', 'scipy', 'Pillow']
     for pkg in extra_packages:
@@ -163,74 +233,204 @@ def _llm_generate_code(algo_name: str, dependencies: List[str], verbose: bool = 
                     print(f"[Downloader] ✅ 已安装 {pkg}")
             except Exception:
                 pass
+
+    system_prompt = """你是一位计算机视觉领域的 Python 专家。
+生成一个封装图像匹配算法的 Python 类。
+
+⚠️️⚠️ 关键：代码必须以下面这些精确的导入语句开头 ⚠️️⚠️
+```python
+import cv2
+import numpy as np
+from agents.match_result import MatchResult
+# 其他导入（scipy、skimage、PIL 等）写在下面
+```
+绝对不能跳过这些导入！即使你的算法使用 numpy/scipy/skimage，你仍然需要 cv2 进行图像预处理。
+
+代码模板（遵循此结构）：
+```python
+import cv2
+import numpy as np
+from agents.match_result import MatchResult
+# 可选：from scipy import ...
+# 可选：from skimage import ...
+
+class Algorithm:
+    def default_params(self):
+        return {'param1': value, 'param2': value}
     
-    system_prompt = """You are an expert Python developer for computer vision.
-Generate a Python class that wraps an image matching algorithm.
+    def run(self, template, scene, **params):
+        params = {**self.default_params(), **params}
+        
+        # 如果需要，转换为灰度图
+        if len(template.shape) == 3:
+            template = cv2.cvtColor(template, cv2.COLOR_BGR2GRAY)
+        if len(scene.shape) == 3:
+            scene = cv2.cvtColor(scene, cv2.COLOR_BGR2GRAY)
+        
+        # 你的算法实现写在这里...
+        
+        return MatchResult(
+            algorithm='algorithm_name',
+            found=found,
+            confidence=confidence,
+            location=location,
+            size=size
+        )
+```
 
-CRITICAL REQUIREMENTS:
-1. ⚠️ The class MUST be named EXACTLY 'Algorithm' (NOT SiftMatchingAlgorithm, NOT TemplateMatcher, etc.)
-2. Must have a 'default_params()' method returning a dict of default parameters
-3. Must have a 'run(template, scene, **params)' method that returns a MatchResult object
-4. MatchResult class is already provided - import it with: from agents.match_result import MatchResult
-5. You can use these packages: opencv-python (cv2), numpy (np), scipy, scikit-image (skimage), Pillow (PIL)
-6. Handle edge cases (no features found, etc.)
-7. Return confidence score between 0 and 1
-8. IMPORTANT: For default_params, use ONLY simple Python values (int, float, str, bool)
-   - DO NOT use cv2 constants like cv2.HISTCMP_CORREL, cv2.TM_CCOEFF_NORMED, etc.
-   - Use strings instead: 'HISTCMP_CORREL', 'TM_CCOEFF_NORMED', etc.
-   - In the run() method, convert strings to cv2 constants using if/elif or a mapping dict
-9. This is important because parameters will be JSON serialized and passed between functions
-10. When accessing image shape, remember images can be grayscale (2D) or color (3D):
-    - Use: h, w = template.shape[:2]  # works for both grayscale and color
-    - NOT: h, w, c = template.shape  # fails for grayscale
-11. MatchResult constructor signature:
+关键要求：
+1. ⚠️ 类名必须精确为 'Algorithm'（不能是 SiftMatchingAlgorithm、TemplateMatcher 等其他名称）
+2. 必须有 'default_params()' 方法，返回默认参数 dict
+3. 必须有 'run(template, scene, **params)' 方法，返回 MatchResult 对象
+4. ⚠️️⚠️ 必需的导入 - 你必须在代码开头包含这些精确的导入语句：
+   ```python
+   import cv2
+   import numpy as np
+   from agents.match_result import MatchResult
+   ```
+   - ⚠️️⚠️⚠️  即使你的算法主要使用 numpy/scipy/skimage，你仍然必须导入 cv2
+   - 许多算法需要 cv2 进行图像预处理（颜色转换、缩放等）
+   - 不要忘记这些导入
+   - 不要使用 'cv2' 和 'np' 以外的别名
+   - 如果需要其他库（scipy、skimage、PIL），也要导入
+5. 可以使用的包：opencv-python (cv2)、numpy (np)、scipy、scikit-image (skimage)、Pillow (PIL)
+6. 处理边界情况（未找到特征等）
+7. 返回 0-1 之间的置信度分数
+8. 重要：default_params 只能使用简单的 Python 值（int、float、str、bool）
+   - 不要使用 cv2 常量如 cv2.HISTCMP_CORREL、cv2.TM_CCOEFF_NORMED 等
+   - 使用字符串代替：'HISTCMP_CORREL'、'TM_CCOEFF_NORMED' 等
+   - 在 run() 方法中，使用 if/elif 或映射 dict 将字符串转换为 cv2 常量
+9. 这很重要，因为参数会被 JSON 序列化并在函数之间传递
+10. 访问图像形状时，记住图像可以是灰度（2D）或彩色（3D）：
+    - 使用：h, w = template.shape[:2]  # 适用于灰度和彩色
+    - 不要使用：h, w, c = template.shape  # 灰度图会失败
+11. MatchResult 构造函数签名：
     - MatchResult(algorithm, found, confidence, location=None, size=None)
-    - DO NOT pass 'params' to the constructor
-    - After creating the result, set result.params = params if needed
-12. Use the CORRECT library functions:
-    - For phase correlation: use cv2.phaseCorrel() from OpenCV, NOT scipy.signal
-    - For SSIM: use skimage.metrics.structural_similarity() from scikit-image
-    - For feature matching: use cv2.SIFT_create(), cv2.ORB_create(), etc.
-    - For template matching: use cv2.matchTemplate()
-    - For histogram comparison: use cv2.calcHist() and cv2.compareHist()
-    - ALWAYS check the official documentation for correct API
-    - DO NOT invent or use non-existent functions
-13. CRITICAL: Confidence Score Calculation
-    - Confidence MUST be between 0.0 and 1.0 (inclusive)
-    - For feature matching (SIFT/ORB/AKAZE):
-      * Use Lowe's ratio test to find good matches
-      * confidence = min(1.0, len(good_matches) / max(len(keypoints_template), 1))
-      * This gives ratio of good matches to total features in template
-      * Typically expect: >0.5 for good match, <0.1 for no match
-      * Example: 50 good matches / 100 template keypoints = 0.50
-    - For template matching:
-      * Use cv2.matchTemplate() which returns values in 0-1 range for normalized methods
-      * confidence = max_val from cv2.minMaxLoc()
-      * Typically expect: >0.8 for good match
-    - For SSIM:
-      * Use skimage.metrics.structural_similarity() which returns 0-1
-      * confidence = ssim_score directly
-    - For histogram comparison:
-      * Use cv2.compareHist() - HISTCMP_CORREL returns 0-1
-      * confidence = result directly
-    - NEVER divide by image dimensions or use arbitrary formulas
-    - The confidence should reflect actual matching quality
-14. Follow the project's coding standards:
-    - Use clear, readable code with proper error handling
-    - Handle errors gracefully with try/except blocks
-    - Return proper MatchResult objects in all cases
-    - Ensure the code can be JSON serialized (use native Python types)
-    - Convert images to grayscale when needed using cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    - Validate input parameters at the beginning of run()
-15. IMPORTANT - Use ONLY these standard implementations:
-    - OpenCV: cv2.phaseCorrel(), cv2.matchTemplate(), cv2.SIFT_create(), cv2.ORB_create(), cv2.AKAZE_create(), etc.
-    - scikit-image: skimage.metrics.structural_similarity(), skimage.feature.*, etc.
-    - numpy: np.fft.fft2(), np.correlate(), etc.
-    - NEVER import from scipy.signal unless you are 100% sure the function exists
+    - 不要传递 'params' 给构造函数
+    - 创建结果后，如果需要可以设置 result.params = params
+12. 使用正确的库函数：
+    - 相位相关：使用 OpenCV 的 cv2.phaseCorrel()，不要用 scipy.signal
+    - SSIM：使用 scikit-image 的 skimage.metrics.structural_similarity()
+      * ⚠️ 关键：不要对 SSIM 使用暴力滑动窗口！对大图像来说太慢了。
+      * ⚠️ 你必须实现以下优化策略：
+        ```python
+        # 1. 将图像下采样到 1/4 分辨率
+        scale = 0.25
+        template_small = cv2.resize(template, (int(w_template * scale), int(h_template * scale)))
+        scene_small = cv2.resize(scene, (int(w_scene * scale), int(h_scene * scale)))
+        
+        # 2. 使用步长跳过像素
+        step = max(1, int(2 / scale))  # scale = 0.25 时 step = 8
+        for y in range(0, h_ss - h_ts + 1, step):
+            for x in range(0, w_ss - w_ts + 1, step):
+                ssim_score = structural_similarity(template_small, scene_small[y:y+h, x:x+w])
+        
+        # 3. 缩放回原始坐标
+        best_x = int(best_location_small[0] / scale)
+        best_y = int(best_location_small[1] / scale)
+        ```
+      * 此优化对大图像（1920x1080）提供约 1000 倍加速
+      * 没有此优化，代码会太慢而无法使用
+      * ⚠️ 重要：调用 structural_similarity() 时正确处理小图像：
+        - 如果图像小于 7x7，传递 win_size 参数：win_size=min(7, min(patch.shape))
+        - 或对小图像使用：structural_similarity(..., win_size=3, channel_axis=None)
+        - 这可以防止测试期间出现 "win_size exceeds image extent" 错误
+    - 特征匹配：使用 cv2.SIFT_create()、cv2.ORB_create()、cv2.AKAZE_create()、cv2.BRISK_create()
+    - 模板匹配：使用 cv2.matchTemplate()
+    - 直方图比较：使用 cv2.calcHist() 和 cv2.compareHist()
+    - 始终查阅 OpenCV 官方文档获取正确的 API
+    - 不要发明或使用不存在的函数
+    - 关键：如果你对 API 不是 100% 确定，使用你确定存在的更简单的替代方案
+    - 例如：ECC 配准很复杂，如果不确定就不要使用
+13. 关键：置信度分数计算
+    - 置信度必须在 0.0 和 1.0 之间（包含）
+    - 对于特征匹配（SIFT/ORB/AKAZE）：
+      * 步骤 1：使用 RANSAC 从 good matches 中找到 inliers
+      * 步骤 2：检查几何有效性：
+        - 使用单应性矩阵变换模板角点
+        - 计算有多少角点保持在场景边界内（带 20% 边距）
+        - bounds_score = corners_in_bounds / 4.0
+      * 步骤 3：组合信号：
+        - inlier_ratio = inlier_count / len(good_matches)
+        - match_quality = len(good_matches) / len(all_matches)
+        - confidence = inlier_ratio * 0.5 + bounds_score * 0.3 + match_quality * 0.2
+      * 步骤 4：应用惩罚：
+        - 如果 inlier_ratio < 0.5：confidence *= 0.5（对低几何一致性的重惩罚）
+        - 上限 0.95 避免过度自信（为参数调优留空间）
+      * 这确保：错误匹配即使有很多 inliers 也会得到低置信度
+      * 典型值：好匹配 → 0.4-0.8，错误匹配 → 0.1-0.3
+    - 对于模板匹配：
+      * 使用 cv2.matchTemplate()，根据方法不同返回特定范围的值：
+        - TM_CCOEFF_NORMED：-1 到 1（1 是完美匹配，但通常 0.7+ 算好）
+        - TM_CCORR_NORMED：0 到 1（1 是完美匹配）
+        - TM_SQDIFF_NORMED：0 到 1（0 是完美匹配，所以 confidence = 1 - min_val）
+      * 关键：不要手动归一化归一化方法的结果！
+        cv2.matchTemplate() 已经返回正确归一化的值。
+        删除这行错误代码：result = (result + 1) / 2
+      * 对于 TM_CCOEFF_NORMED，confidence = max_val（已在正确范围）
+      * 对于 TM_CCORR_NORMED，confidence = max_val（已在 0-1 范围）
+      * 对于 TM_SQDIFF_NORMED，confidence = 1 - min_val（反向）
+      * 关键验证：你必须验证匹配位置是否合理：
+        1. 如果 best_location 是 (0, 0) 或非常靠近图像边缘（距边缘<10px），很可能是假阳性
+           → 设置 found=False 和 confidence=0.0（这个匹配可疑）
+        2. 检查模板与场景的面积比：
+           ratio = (template_w * template_h) / (scene_w * scene_h)
+           如果 ratio > 0.5（模板覆盖>50% 的场景），可能是错误的；降低置信度 0.4
+           如果 ratio < 0.001（模板太小），可能是噪声；降低置信度 0.2
+        3. 如果匹配区域覆盖>80% 的场景，几乎肯定是假阳性
+        4. 在设置 found=True 之前应用惩罚：
+           如果位置可疑：confidence *= 0.5
+           如果面积比太大：confidence *= 0.6
+      * 只有当 confidence >= threshold 且位置通过验证时才设置 found=True
+      * 通常期望：TM_CCOEFF_NORMED 的好匹配 >0.7
+    - 对于 SSIM：
+      * 使用 skimage.metrics.structural_similarity() 返回 0-1
+      * confidence = ssim_score 直接
+      * ⚠️ 关键：正确处理小图像
+        - 设置 win_size=min(7, min(patch.shape))
+        - 如果 SSIM 返回 NaN 或负数，设置 confidence=0.0
+    - 对于归一化互相关（NCC）：
+      * ⚠️ 关键：使用 cv2.matchTemplate() 而不是 scipy.signal.correlate2d！
+      * 使用 cv2.matchTemplate(scene, template, cv2.TM_CCOEFF_NORMED)
+      * 结果已经在 0-1 范围内，直接使用 max_val 作为置信度
+      * 不要手动归一化或缩放结果
+      * 如果需要加速，可以先降采样图像，但仍然使用 cv2.matchTemplate()
+    - 对于直方图比较：
+      * 使用 cv2.compareHist() - HISTCMP_CORREL 返回 0-1
+      * confidence = result 直接
+      * ⚠️ 关键性能优化：
+        - 不要对每个位置都计算直方图！这太慢了
+        - 使用降采样：将图像缩小到 1/4 或 1/8
+        - 使用大步长搜索（step >= 50 像素）
+        - 或只比较整图直方图（全局匹配，不滑动窗口）
+        - 目标：在 800x600 图像上运行时间 < 1 秒
+    - 对于感知哈希匹配：
+      * 使用 imagehash.phash() 计算感知哈希
+      * ⚠️ 关键性能优化：
+        - 不要对每个滑动窗口位置都计算哈希！这太慢了
+        - 只计算整个场景的哈希，与模板哈希比较（全局匹配）
+        - 计算汉明距离：distance = hash1 - hash2
+        - 置信度 = 1 - (distance / (hash_size * hash_size))
+        - 如果场景比模板大很多，只比较整图（不滑动窗口）
+        - 目标：在 800x600 图像上运行时间 < 0.1 秒
+    - 永远不要除以图像维度或使用任意公式
+    - 置信度应该反映真实的匹配质量
+14. 遵循项目的编码标准：
+    - 使用清晰、可读的代码，带有适当的错误处理
+    - 使用 try/except 块优雅地处理错误
+    - 在所有情况下都返回正确的 MatchResult 对象
+    - 确保代码可以被 JSON 序列化（使用原生 Python 类型）
+    - 需要时使用 cv2.cvtColor(img, cv2.COLOR_BGR2GRAY) 将图像转换为灰度
+    - 在 run() 开始处验证输入参数
+15. 重要 - 只使用这些标准实现：
+    - OpenCV：cv2.phaseCorrel()、cv2.matchTemplate()、cv2.SIFT_create()、cv2.ORB_create()、cv2.AKAZE_create() 等
+    - scikit-image：skimage.metrics.structural_similarity()、skimage.feature.* 等
+    - numpy：np.fft.fft2()、np.correlate() 等
+    - 除非你 100% 确定函数存在，否则永远不要从 scipy.signal 导入
 
-⚠️ REMINDER: The class name MUST be EXACTLY 'Algorithm', not any other name!
+⚠️ 提醒：类名必须精确为 'Algorithm'，不能是其他名称！
 
-Example code for feature matching (SIFT/ORB/AKAZE) with CORRECT confidence calculation:
+特征匹配（SIFT/ORB/AKAZE）带有正确置信度计算的示例代码：
 ```python
 import cv2
 import numpy as np
@@ -240,17 +440,17 @@ class Algorithm:
     def default_params(self):
         return {
             'method': 'SIFT',
-            'threshold': 0.7,  # Lowe's ratio test threshold
-            'confidence_threshold': 0.3  # Minimum confidence to say "found"
+            'threshold': 0.7,  # Lowe's ratio test 阈值
+            'confidence_threshold': 0.3  # 判定"找到"的最小置信度
         }
 
     def run(self, template, scene, **params):
         params = {**self.default_params(), **params}
         
         if template is None or scene is None:
-            raise ValueError("Template and scene must be provided")
+            raise ValueError("必须提供 template 和 scene")
         
-        # Convert to grayscale
+        # 转换为灰度图
         if len(template.shape) == 3:
             template = cv2.cvtColor(template, cv2.COLOR_BGR2GRAY)
         if len(scene.shape) == 3:
@@ -259,7 +459,7 @@ class Algorithm:
         try:
             method = params['method']
             
-            # Create detector based on method
+            # 根据 method 创建检测器
             if method == 'SIFT':
                 detector = cv2.SIFT_create()
             elif method == 'ORB':
@@ -269,25 +469,25 @@ class Algorithm:
             else:
                 detector = cv2.SIFT_create()
             
-            # Detect and compute features
+            # 检测和计算特征
             kp1, des1 = detector.detectAndCompute(template, None)
             kp2, des2 = detector.detectAndCompute(scene, None)
             
-            # Check if enough features found
+            # 检查是否找到足够的特征
             if len(kp1) < 4 or len(kp2) < 4:
                 return MatchResult(method, False, 0.0)
             
-            # Match features using BFMatcher
+            # 使用 BFMatcher 匹配特征
             if method == 'ORB':
-                # ORB uses binary descriptors, use Hamming distance
+                # ORB 使用二进制描述子，使用汉明距离
                 bf = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=False)
                 matches = bf.knnMatch(des1, des2, k=2)
             else:
-                # SIFT/AKAZE use float descriptors, use L2 distance
+                # SIFT/AKAZE 使用浮点描述子，使用 L2 距离
                 bf = cv2.BFMatcher(cv2.NORM_L2, crossCheck=False)
                 matches = bf.knnMatch(des1, des2, k=2)
             
-            # Apply Lowe's ratio test
+            # 应用 Lowe's ratio test
             ratio_threshold = params.get('threshold', 0.7)
             good_matches = []
             for m_n in matches:
@@ -296,24 +496,75 @@ class Algorithm:
                     if m.distance < ratio_threshold * n.distance:
                         good_matches.append(m)
             
-            # Calculate confidence: ratio of good matches to template keypoints
-            confidence = min(1.0, len(good_matches) / max(len(kp1), 1))
+            # 🔴 正确的置信度计算：使用 RANSAC inlier 比率 + 几何验证
+            # 关键原则：置信度必须反映真实的几何一致性
+            # 错误的匹配如果单应性拟合了噪声，也可能有很多 inliers！
             
-            # Find location if enough good matches
-            found = confidence >= params.get('confidence_threshold', 0.3)
-            
-            if found and len(good_matches) >= 4:
+            if len(good_matches) >= 4:
                 src_pts = np.float32([kp1[m.queryIdx].pt for m in good_matches]).reshape(-1, 1, 2)
                 dst_pts = np.float32([kp2[m.trainIdx].pt for m in good_matches]).reshape(-1, 1, 2)
                 
-                M, mask = cv2.findHomography(src_pts, dst_pts, cv2.RANSAC, 5.0)
+                M, mask = cv2.findHomography(src_pts, dst_pts, cv2.RANSAC, 3.0)
                 
+                if M is not None and mask is not None:
+                    inlier_count = int(mask.sum())
+                    inlier_ratio = inlier_count / max(len(good_matches), 1)
+                    
+                    # 🔴 关键：检查单应性在几何上是否有效
+                    # 变换模板角点并检查它们是否保持在场景边界内
+                    h_scene, w_scene = scene.shape[:2]
+                    h_template, w_template = template.shape[:2]
+                    
+                    template_corners = np.float32([
+                        [0, 0], [w_template, 0], 
+                        [w_template, h_template], [0, h_template]
+                    ]).reshape(-1, 1, 2)
+                    
+                    transformed_corners = cv2.perspectiveTransform(template_corners, M)
+                    
+                    # 检查大多数角点是否在场景边界内（带 20% 边距容差）
+                    margin_x, margin_y = w_scene * 0.2, h_scene * 0.2
+                    corners_in_bounds = 0
+                    for corner in transformed_corners:
+                        x, y = corner[0]
+                        if -margin_x <= x <= w_scene + margin_x and -margin_y <= y <= h_scene + margin_y:
+                            corners_in_bounds += 1
+                    
+                    bounds_score = corners_in_bounds / 4.0
+                    
+                    # 🔴 匹配质量：good matches 与总可能匹配数的比率
+                    match_quality = len(good_matches) / max(len(matches), 1)
+                    
+                    # 🔴 最终置信度：加权组合
+                    # - inlier_ratio：几何一致性（最重要）
+                    # - bounds_score：空间有效性
+                    # - match_quality：特征丰富度
+                    confidence = (inlier_ratio * 0.5 + bounds_score * 0.3 + match_quality * 0.2)
+                    
+                    # 🔴 严格：只有高 inlier 比率才能获得高置信度
+                    if inlier_ratio < 0.5:
+                        confidence *= 0.5  # 对低 inlier 比率的重惩罚
+                    
+                    # 🔴 上限 0.95 避免过度自信（为调优留空间）
+                    confidence = min(0.95, confidence)
+                else:
+                    # 未找到有效的单应性
+                    confidence = len(good_matches) / max(len(matches), 1) * 0.3
+            else:
+                # 没有足够的匹配进行 RANSAC
+                confidence = len(good_matches) / max(len(matches), 1) * 0.2
+            
+            # 如果有足够的 good matches，找到位置
+            found = confidence >= params.get('confidence_threshold', 0.3)
+            
+            if found and len(good_matches) >= 4:
+                # 重新计算单应性获取位置（上面已为置信度计算过）
                 if M is not None:
                     h, w = template.shape[:2]
                     pts = np.float32([[0, 0], [0, h - 1], [w - 1, h - 1], [w - 1, 0]]).reshape(-1, 1, 2)
                     dst = cv2.perspectiveTransform(pts, M)
                     
-                    # Get bounding box
+                    # 获取边界框
                     x = int(np.min(dst[:, :, 0]))
                     y = int(np.min(dst[:, :, 1]))
                     width = int(np.max(dst[:, :, 0]) - x)
@@ -343,24 +594,24 @@ class Algorithm:
             )
 ```
 
-Respond ONLY with the Python code, no explanations, no markdown code blocks."""
+仅返回 Python 代码，不要解释，不要 markdown 代码块。"""
 
-    user_prompt = f"""Generate a complete Python implementation for the '{algo_name}' algorithm.
+    user_prompt = f"""生成一个完整的 Python 实现，用于 '{algo_name}' 算法。
 
-Required packages: {', '.join(dependencies)}
+必需的包：{', '.join(dependencies)}
 
-The algorithm should:
-1. Accept two images: template (small patch) and scene (larger image)
-2. Find the template within the scene
-3. Return location (x, y), size (width, height), and confidence (0-1)
+该算法应该：
+1. 接受两个图像：template（小模板）和 scene（大场景图像）
+2. 在 scene 中找到 template
+3. 返回位置 (x, y)、大小 (width, height) 和置信度 (0-1)
 
-Generate a complete, working implementation with proper error handling.
-DO NOT include markdown code blocks (```python or ```), just pure Python code."""
+生成一个完整、可工作的实现，带有适当的错误处理。
+不要包含 markdown 代码块（```python 或 ```），只返回纯 Python 代码。"""
 
     # Try up to 3 times with stronger prompts if needed
     for attempt in range(3):
         response = call_qwen_text(system_prompt, user_prompt)
-        
+
         if response:
             # 清理 markdown 代码块标记
             code = response.strip()
@@ -369,9 +620,9 @@ DO NOT include markdown code blocks (```python or ```), just pure Python code.""
                 code = "\n".join(line for line in lines if not line.strip().startswith("```"))
             if code.startswith("python"):
                 code = code[6:]
-            
+
             code = code.strip()
-            
+
             # 验证代码
             if _validate_generated_code(code, algo_name, verbose=verbose):
                 if verbose:
@@ -388,7 +639,7 @@ DO NOT include markdown code blocks (```python or ```), just pure Python code.""
         else:
             if verbose:
                 print(f"[Downloader] ❌ LLM 生成代码失败（第 {attempt + 1} 次）")
-    
+
     if verbose:
         print(f"[Downloader] ❌ LLM 生成代码失败（已重试3次）")
     return None
@@ -397,13 +648,13 @@ DO NOT include markdown code blocks (```python or ```), just pure Python code.""
 def _validate_generated_code(code: str, algo_name: str, verbose: bool = True) -> bool:
     """
     验证生成的代码是否能正常运行
-    
+
     验证步骤：
     1. 语法检查
     2. 检查是否有 Algorithm 类
     3. 检查是否有 default_params 和 run 方法
     4. 尝试用测试数据运行
-    
+
     Returns:
         代码是否有效
     """
@@ -414,22 +665,22 @@ def _validate_generated_code(code: str, algo_name: str, verbose: bool = True) ->
         if verbose:
             print(f"[Downloader] 代码语法错误：{e}")
         return False
-    
+
     # 2. 创建测试环境并执行代码
     try:
         # 创建命名空间，预先导入所有可能需要的模块
         namespace = {}
-        
+
         # 导入必要的模块
         import numpy as np
         import cv2
         namespace['np'] = np
         namespace['cv2'] = cv2
-        
+
         # 导入 MatchResult（LLM 生成的代码可能会用到）
         from agents.match_result import MatchResult
         namespace['MatchResult'] = MatchResult
-        
+
         # 导入其他常用库（防止 LLM 生成的代码需要）
         try:
             import skimage
@@ -440,45 +691,45 @@ def _validate_generated_code(code: str, algo_name: str, verbose: bool = True) ->
             namespace['feature'] = feature
         except ImportError:
             pass
-        
+
         try:
             from scipy import ndimage, signal
             namespace['ndimage'] = ndimage
             namespace['signal'] = signal
         except ImportError:
             pass
-        
+
         try:
             from PIL import Image
             namespace['Image'] = Image
         except ImportError:
             pass
-        
+
         # 执行代码
         exec(code, namespace)
-        
+
         # 3. 检查是否有 Algorithm 类
         if 'Algorithm' not in namespace:
             if verbose:
                 print(f"[Downloader] 代码中没有 Algorithm 类")
             return False
-        
+
         Algorithm = namespace['Algorithm']
-        
+
         # 4. 检查是否有必要的方法
         if not hasattr(Algorithm, 'default_params') or not callable(getattr(Algorithm, 'default_params')):
             if verbose:
                 print(f"[Downloader] Algorithm 缺少 default_params 方法")
             return False
-        
+
         if not hasattr(Algorithm, 'run') or not callable(getattr(Algorithm, 'run')):
             if verbose:
                 print(f"[Downloader] Algorithm 缺少 run 方法")
             return False
-        
+
         # 5. 创建实例并测试
         algo_instance = Algorithm()
-        
+
         # 6. 测试 default_params
         try:
             params = algo_instance.default_params()
@@ -490,35 +741,35 @@ def _validate_generated_code(code: str, algo_name: str, verbose: bool = True) ->
             if verbose:
                 print(f"[Downloader] default_params() 调用失败：{e}")
             return False
-        
+
         # 7. 用测试数据运行（小图像）
         try:
             test_template = np.random.randint(0, 255, (20, 20, 3), dtype=np.uint8)
             test_scene = np.random.randint(0, 255, (50, 50, 3), dtype=np.uint8)
-            
+
             result = algo_instance.run(test_template, test_scene, **params)
-            
+
             # 8. 验证返回结果
             if not isinstance(result, MatchResult):
                 if verbose:
                     print(f"[Downloader] run() 应该返回 MatchResult 对象")
                 return False
-            
+
             # 9. 验证置信度在 0-1 之间
             if not (0 <= result.confidence <= 1):
                 if verbose:
                     print(f"[Downloader] 置信度应该在 0-1 之间，实际为 {result.confidence}")
                 # 这个可以放宽，不直接返回 False
-            
+
             if verbose:
                 print(f"[Downloader] ✅ 代码验证通过（测试运行成功）")
             return True
-            
+
         except Exception as e:
             if verbose:
                 print(f"[Downloader] run() 测试失败：{e}")
             return False
-        
+
     except Exception as e:
         if verbose:
             print(f"[Downloader] 代码执行错误：{e}")
@@ -526,16 +777,192 @@ def _validate_generated_code(code: str, algo_name: str, verbose: bool = True) ->
 
 
 def _save_and_load(code: str, algo_name: str, verbose: bool = True) -> Optional[object]:
-    """保存代码到缓存并加载"""
+    """保存代码到缓存并加载（带语法检查和测试）"""
+
+    # 🔴 步骤 1: 语法检查
+    if verbose:
+        print(f"[Downloader] 正在检查语法...")
+    try:
+        compile(code, '<string>', 'exec')
+        if verbose:
+            print(f"[Downloader] ✅ 语法检查通过")
+    except SyntaxError as e:
+        if verbose:
+            print(f"[Downloader] ❌ 语法错误：{e}")
+        return None
+
+    # 🔴 步骤 2: 测试运行（检查 API 是否存在）
+    if verbose:
+        print(f"[Downloader] 正在测试运行...")
+
+    test_module = _test_run_code(code, algo_name, verbose=verbose)
+    if test_module is None:
+        if verbose:
+            print(f"[Downloader] ❌ 测试运行失败")
+        return None
+
+    # 🔴 步骤 3: 保存到缓存
     ALGORITHM_CACHE_DIR.mkdir(exist_ok=True)
     cache_key = hashlib.md5((algo_name + code).encode()).hexdigest()[:12]
     cache_file = ALGORITHM_CACHE_DIR / f"{algo_name}_{cache_key}.py"
     cache_file.write_text(code, encoding="utf-8")
 
     if verbose:
-        print(f"[Downloader] 已保存：{cache_file}")
+        print(f"[Downloader] ✅ 已保存：{cache_file}")
 
-    return _load_module(cache_file, algo_name)
+    return test_module
+
+
+def _test_run_code(code: str, algo_name: str, verbose: bool = True) -> Optional[object]:
+    """
+    测试运行生成的代码，检查 API 是否存在
+
+    流程：
+    1. 在隔离的命名空间中执行代码
+    2. 检查 Algorithm 类是否存在
+    3. 检查 default_params() 是否能正常调用
+    4. 检查 run() 方法是否存在
+    5. 🔴 用测试图像实际运行 run() 方法（检查导入是否完整）
+
+    返回：测试通过的模块，或 None
+    """
+    import types
+    import numpy as np
+
+    try:
+        # 创建隔离的命名空间
+        namespace = {
+            '__name__': f'test_{algo_name}',
+            '__builtins__': __builtins__,
+        }
+
+        # 执行代码
+        exec(code, namespace)
+
+        # 检查 Algorithm 类
+        if 'Algorithm' not in namespace:
+            if verbose:
+                print(f"[Downloader] ❌ 缺少 Algorithm 类")
+            return None
+
+        # 实例化
+        algo_instance = namespace['Algorithm']()
+
+        # 检查 default_params()
+        try:
+            params = algo_instance.default_params()
+            if not isinstance(params, dict):
+                if verbose:
+                    print(f"[Downloader] ❌ default_params() 返回值不是 dict")
+                return None
+            if verbose:
+                print(f"[Downloader] ✅ default_params() 测试通过")
+        except AttributeError as e:
+            if verbose:
+                print(f"[Downloader] ❌ 缺少 default_params() 方法：{e}")
+            return None
+        except Exception as e:
+            if verbose:
+                print(f"[Downloader] ❌ default_params() 执行失败：{e}")
+            return None
+
+        # 检查 run() 方法
+        if not hasattr(algo_instance, 'run'):
+            if verbose:
+                print(f"[Downloader] ❌ 缺少 run() 方法")
+            return None
+
+        # 🔴 用测试图像实际运行 run() 方法
+        if verbose:
+            print(f"[Downloader] 正在用测试图像运行 run()...")
+
+        try:
+            # 🔴 创建测试图像（彩色和灰度都测试）
+            # 测试 1: 灰度图像
+            test_template_gray = np.zeros((20, 20), dtype=np.uint8)
+            test_scene_gray = np.zeros((50, 50), dtype=np.uint8)
+
+            # 测试 2: 彩色图像（触发 cv2.cvtColor）
+            test_template_color = np.zeros((20, 20, 3), dtype=np.uint8)
+            test_scene_color = np.zeros((50, 50, 3), dtype=np.uint8)
+
+            # 尝试运行灰度图像
+            result = algo_instance.run(test_template_gray, test_scene_gray, **params)
+
+            # 尝试运行彩色图像（测试是否会调用 cv2.cvtColor）
+            result = algo_instance.run(test_template_color, test_scene_color, **params)
+
+            # 🔴 测试 3: 性能测试（针对 SSIM 等需要优化的算法）
+            # 如果算法名称包含 'ssim'，测试大图像上的性能
+            if 'ssim' in algo_name.lower():
+                if verbose:
+                    print(f"[Downloader] 正在进行性能测试（大图像）...")
+
+                import time
+                # 创建较大的测试图像（模拟真实场景）
+                large_template = np.random.randint(0, 255, (200, 200), dtype=np.uint8)
+                large_scene = np.random.randint(0, 255, (800, 800), dtype=np.uint8)
+
+                start_time = time.time()
+                result = algo_instance.run(large_template, large_scene, **params)
+                elapsed_time = time.time() - start_time
+
+                # 🔴 性能要求：大图像上必须在 5 秒内完成
+                if elapsed_time > 5.0:
+                    if verbose:
+                        print(f"[Downloader] ❌ 性能不达标：耗时 {elapsed_time:.2f}秒（要求<5 秒）")
+                        print(f"[Downloader] 提示：SSIM 必须使用 downsampling 优化")
+                    return None
+
+                if verbose:
+                    print(f"[Downloader] ✅ 性能测试通过：耗时 {elapsed_time:.2f}秒")
+
+            if verbose:
+                print(f"[Downloader] ✅ run() 测试运行成功（灰度 + 彩色）")
+
+        except NameError as e:
+            # 🔴 捕获 "name 'cv2' is not defined" 这类错误
+            if verbose:
+                print(f"[Downloader] ❌ 缺少导入：{e}")
+                print(f"[Downloader] 提示：代码中可能缺少必要的 import 语句")
+            return None
+        except ValueError as e:
+            # 参数验证错误（如需要灰度图），这是正常的
+            if verbose:
+                print(f"[Downloader] ⚠️ 参数验证提示：{e}")
+                print(f"[Downloader] ✅ 但 API 存在，继续")
+        except TypeError as e:
+            # 🔴 类型错误（如 cv2.cvtColor 参数错误），说明 API 使用有问题
+            if verbose:
+                print(f"[Downloader] ❌ API 使用错误：{e}")
+                print(f"[Downloader] 提示：代码中 cv2 等库的使用可能有误")
+            return None
+        except Exception as e:
+            # 其他错误可能是算法逻辑问题，不影响 API 存在性
+            if verbose:
+                print(f"[Downloader] ⚠️ 运行错误（可能是算法逻辑）：{e}")
+                print(f"[Downloader] ✅ 但 API 存在，继续")
+
+        if verbose:
+            print(f"[Downloader] ✅ run() 方法存在")
+
+        # 返回模块（用于后续加载）
+        module = types.ModuleType(f'test_{algo_name}')
+        module.Algorithm = namespace['Algorithm']
+        return module
+
+    except ImportError as e:
+        if verbose:
+            print(f"[Downloader] ❌ 导入失败：{e}")
+        return None
+    except AttributeError as e:
+        if verbose:
+            print(f"[Downloader] ❌ API 不存在：{e}")
+        return None
+    except Exception as e:
+        if verbose:
+            print(f"[Downloader] ❌ 测试运行失败：{e}")
+        return None
 
 
 def _load_from_cache(algo_name: str) -> Optional[object]:
@@ -690,116 +1117,6 @@ def _load_module(file_path: Path, module_name: str) -> Optional[object]:
     except Exception as e:
         print(f"[Downloader] 加载模块失败：{e}")
         return None
-
-
-def _normalize_algorithm_name(algo_name: str) -> str:
-    """
-    标准化算法名称（处理 LLM 推荐的不同命名变体）
-    
-    策略：
-    1. 精确匹配别名表
-    2. 模糊匹配（去除下划线、连字符、空格后比较）
-    3. 包含匹配（检查是否包含已知算法名称关键词）
-    
-    Returns:
-        标准化后的算法名称
-    """
-    if not algo_name:
-        return algo_name
-    
-    # 1. 精确匹配别名表
-    if algo_name in ALGORITHM_ALIASES:
-        return ALGORITHM_ALIASES[algo_name]
-    
-    # 2. 标准化后匹配（去除分隔符）
-    normalized = algo_name.lower().replace("_", "").replace("-", "").replace(" ", "")
-    for alias, canonical in ALGORITHM_ALIASES.items():
-        alias_normalized = alias.lower().replace("_", "").replace("-", "").replace(" ", "")
-        if normalized == alias_normalized:
-            return canonical
-    
-    # 3. 包含匹配（仅当输入名称包含别名关键词，且不是标准算法名时）
-    #    避免将 feature_matching 错误匹配到 sift_matching
-    algo_lower = algo_name.lower()
-    if algo_lower not in PIP_PACKAGES:  # 不是标准算法名
-        for alias, canonical in ALGORITHM_ALIASES.items():
-            alias_normalized = alias.lower().replace("_", "").replace("-", "").replace(" ", "")
-            # 确保别名不是另一个标准算法名的一部分
-            if alias_normalized in normalized:
-                # 额外检查：如果别名是某个标准算法名的一部分，需要完全匹配
-                if canonical in PIP_PACKAGES:
-                    # 只有当输入名称也包含标准算法名时才匹配
-                    canonical_normalized = canonical.lower().replace("_", "").replace("-", "")
-                    if canonical_normalized in normalized or normalized == canonical_normalized:
-                        return canonical
-                else:
-                    return canonical
-    
-    # 4. 检查是否包含 PIP_PACKAGES 中的关键词（完全匹配）
-    for pkg_name in PIP_PACKAGES.keys():
-        if algo_lower == pkg_name:
-            return pkg_name
-    
-    # 5. 都不匹配，返回原始名称
-    return algo_name
-
-
-def check_and_install_deps(algo_name: str, verbose: bool = True) -> bool:
-    """检查并安装算法所需的 pip 依赖"""
-    # 先标准化算法名称
-    algo_name = _normalize_algorithm_name(algo_name)
-    
-    deps = PIP_PACKAGES.get(algo_name, [])
-    if not deps:
-        return True
-
-    missing = []
-    for dep in deps:
-        # 检查包是否已安装
-        IMPORT_MAP = {
-            "opencv-python": "cv2",
-            "opencv-contrib-python": "cv2",
-            "Pillow": "PIL",
-            "scikit-image": "skimage"
-            }
-        
-        pkg_name = IMPORT_MAP.get(dep, dep.replace("-", "_").replace("[", "").replace("]", ""))
-
-        try:
-            __import__(pkg_name)
-
-        except ImportError:
-            missing.append(dep)
-
-    if not missing:
-        if verbose:
-            print(f"[Downloader] ✅ {algo_name} 依赖已满足")
-        return True
-
-    if verbose:
-        print(f"[Downloader] 需要安装依赖：{missing}")
-        print(f"[Downloader] 正在自动安装...")
-
-    for dep in missing:
-        try:
-            subprocess.check_call(
-                [sys.executable, "-m", "pip", "install", dep, "-q"],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-            )
-            if verbose:
-                print(f"[Downloader] ✅ 已安装 {dep}")
-        except Exception as e:
-            if verbose:
-                print(f"[Downloader] ❌ 安装 {dep} 失败：{e}")
-                print(f"[Downloader] 请手动运行：pip install {dep}")
-            return False
-    return True
-
-
-def get_algorithm_module(algo_name: str) -> Optional[object]:
-    """获取已下载的算法模块"""
-    return _load_from_cache(algo_name)
 
 
 def clear_cache():

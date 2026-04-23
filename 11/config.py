@@ -29,10 +29,10 @@ LLM_PROVIDER = "qwen"
 # ==============================================
 # 🔴 关键修改：直接填入你的 API Key
 # ==============================================
-QWEN_API_KEY = "sk-e41f51d425434b68bdf8db2a26a83391"
+QWEN_API_KEY = "sk-3e582f0cb89d42fb9305ec242fdae65c"
 QWEN_BASE_URL = os.environ.get("QWEN_BASE_URL", "https://dashscope.aliyuncs.com/compatible-mode/v1")
 # Use text-only model (no vision)
-QWEN_MODEL = os.environ.get("QWEN_MODEL", "qwen-turbo-1101")
+QWEN_MODEL = os.environ.get("QWEN_MODEL", "qwen-vl-plus")
 
 # Effective toggle for whether LLM path should be used.
 if LLM_PROVIDER == "anthropic":
